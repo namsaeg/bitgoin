@@ -1,20 +1,25 @@
 package transaction
 
-// 1. 함수에 입력이 하나라도 있다면 error 반환하기
-// 2. 구조체 변수를 복사할 때는 무조건 Clone 사용하기
-// 3. (p Tx) 대신 (p *Tx) 사용하기
-// 4. 함수의 매개변수나 반환값으로 구조체 변수를 줄 때는 무조건 포인터 쓰기
-// 5. getter의 반환값으로 슬라이스를 줄 때 무조건 copy한 복사본을 반환하기
-
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"slices"
 	"strings"
 )
+
+var (
+	ErrSegwitUnsupported    = errors.New("segwit transactions are not supported")
+	ErrTxOutIndexOutOfRange = errors.New("output index out of range")
+	ErrCoinbaseFee          = errors.New("coinbase transaction has no fee")
+	ErrNegativeFee          = errors.New("outputs exceed inputs")
+	ErrAmountOverflow       = errors.New("amount sum overflows uint64")
+)
+
+const maxPrealloc = 1024
 
 type Tx struct {
 	version  uint32
@@ -23,249 +28,205 @@ type Tx struct {
 	locktime uint32
 }
 
-func NewTx(version uint32, txIns []*TxIn, txOuts []*TxOut, locktime uint32) (*Tx, error) {
-	var result Tx
-
-	result.version = version
-
-	result.txIns = make([]*TxIn, len(txIns))
-	for i := range txIns {
-		result.txIns[i] = txIns[i].Clone()
+func NewTx(version uint32, txIns []*TxIn, txOuts []*TxOut, locktime uint32) *Tx {
+	return &Tx{
+		version:  version,
+		txIns:    cloneAll(txIns),
+		txOuts:   cloneAll(txOuts),
+		locktime: locktime,
 	}
-
-	result.txOuts = make([]*TxOut, len(txOuts))
-	for i := range txOuts {
-		result.txOuts[i] = txOuts[i].Clone()
-	}
-
-	result.locktime = locktime
-
-	return &result, nil
 }
 
 func (p *Tx) Version() uint32 {
 	return p.version
 }
-func (p *Tx) SetVersion(version uint32) error {
-	p.version = version
 
-	return nil
+func (p *Tx) SetVersion(version uint32) {
+	p.version = version
 }
 
 func (p *Tx) TxIns() []*TxIn {
-	var txIns []*TxIn = make([]*TxIn, len(p.txIns))
-	for i := range p.txIns {
-		txIns[i] = p.txIns[i].Clone()
-	}
-
-	return txIns
+	return cloneAll(p.txIns)
 }
-func (p *Tx) SetTxIns(txIns []*TxIn) error {
-	p.txIns = make([]*TxIn, len(txIns))
-	for i := range txIns {
-		p.txIns[i] = txIns[i].Clone()
-	}
 
-	return nil
+func (p *Tx) SetTxIns(txIns []*TxIn) {
+	p.txIns = cloneAll(txIns)
 }
 
 func (p *Tx) TxOuts() []*TxOut {
-	var txOuts []*TxOut = make([]*TxOut, len(p.txOuts))
-	for i := range p.txOuts {
-		txOuts[i] = p.txOuts[i].Clone()
-	}
-
-	return txOuts
+	return cloneAll(p.txOuts)
 }
-func (p *Tx) SetTxOuts(txOuts []*TxOut) error {
-	p.txOuts = make([]*TxOut, len(txOuts))
-	for i := range txOuts {
-		p.txOuts[i] = txOuts[i].Clone()
-	}
 
-	return nil
+func (p *Tx) SetTxOuts(txOuts []*TxOut) {
+	p.txOuts = cloneAll(txOuts)
+}
+
+func (p *Tx) TxOut(i uint32) (*TxOut, error) {
+	if i >= uint32(len(p.txOuts)) {
+		return nil, fmt.Errorf("txOuts index out of range: index %d (len %d)", i, len(p.txOuts))
+	}
+	return p.txOuts[i], nil
 }
 
 func (p *Tx) Locktime() uint32 {
 	return p.locktime
 }
-func (p *Tx) SetLocktime(locktime uint32) error {
-	p.locktime = locktime
 
-	return nil
+func (p *Tx) SetLocktime(locktime uint32) {
+	p.locktime = locktime
 }
 
 func (p *Tx) Clone() *Tx {
-	var result Tx
-
-	result.version = p.version
-
-	result.txIns = make([]*TxIn, len(p.txIns))
-	for i := range p.txIns {
-		result.txIns[i] = p.txIns[i].Clone()
+	return &Tx{
+		version:  p.version,
+		txIns:    cloneAll(p.txIns),
+		txOuts:   cloneAll(p.txOuts),
+		locktime: p.locktime,
 	}
+}
 
-	result.txOuts = make([]*TxOut, len(p.txOuts))
-	for i := range p.txOuts {
-		result.txOuts[i] = p.txOuts[i].Clone()
+func (p *Tx) ID() [32]byte {
+	first := sha256.Sum256(p.Serialize())
+	id := sha256.Sum256(first[:])
+	slices.Reverse(id[:])
+	return id
+}
+
+func (p *Tx) IsCoinbase() bool {
+	return len(p.txIns) == 1 &&
+		p.txIns[0].prevTxID == [32]byte{} &&
+		p.txIns[0].prevTxOutIdx == 0xffffffff
+}
+
+func (p *Tx) Fee(f TxFetcher) (uint64, error) {
+	if p.IsCoinbase() {
+		return 0, ErrCoinbaseFee
 	}
+	var in, out uint64
+	for i, txIn := range p.txIns {
+		v, err := txIn.Value(f)
+		if err != nil {
+			return 0, fmt.Errorf("txin %d: %w", i, err)
+		}
+		if in, err = addAmount(in, v); err != nil {
+			return 0, err
+		}
+	}
+	for _, txOut := range p.txOuts {
+		var err error
+		if out, err = addAmount(out, txOut.Amount()); err != nil {
+			return 0, err
+		}
+	}
+	if out > in {
+		return 0, fmt.Errorf("%w: in %d sat, out %d sat", ErrNegativeFee, in, out)
+	}
+	return in - out, nil
+}
 
-	result.locktime = p.locktime
+func (p *Tx) GetMessage(f *TxFetcher) ([]byte, error) {
+	tmpTx := p.Clone()
+	for i, txIn := range tmpTx.txIns {
+		prevTx, err := f.FetchTx(txIn.PrevTxID())
+		if err != nil {
+			return nil, fmt.Errorf("cannot get prev tx: %w", err)
+		}
+		prevTxOut, err := prevTx.TxOut(txIn.prevTxOutIdx)
+		if err != nil {
+			return nil, fmt.Errorf("cannot get prev tx out: %w", err)
+		}
+		tmpTx.txIns[i].SetScriptSig(prevTxOut.scriptPubKey)
+	}
+	return tmpTx.Serialize(), nil
+}
 
-	return &result
+func addAmount(a, b uint64) (uint64, error) {
+	sum, carry := bits.Add64(a, b, 0)
+	if carry != 0 {
+		return 0, ErrAmountOverflow
+	}
+	return sum, nil
 }
 
 func (p *Tx) String() string {
-	var (
-		txInsStr  strings.Builder
-		txOutsStr strings.Builder
-	)
-
-	for i := range p.txIns {
-		txInsStr.WriteString(p.txIns[i].String())
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Tx(\nversion: %d\ntxIns:\n", p.version)
+	for _, in := range p.txIns {
+		sb.WriteString(in.String())
+		sb.WriteByte('\n')
 	}
-
-	for i := range p.txOuts {
-		txOutsStr.WriteString(p.txOuts[i].String())
+	sb.WriteString("txOuts:\n")
+	for _, out := range p.txOuts {
+		sb.WriteString(out.String())
+		sb.WriteByte('\n')
 	}
-
-	return fmt.Sprintf("Tx(\nversion: %08x\ntxIns: \n%s\ntxOuts: \n%s\nlocktime: %08x\n)", p.version, txInsStr.String(), txOutsStr.String(), p.locktime)
+	fmt.Fprintf(&sb, "locktime: %d\n)", p.locktime)
+	return sb.String()
 }
-
-func (p *Tx) Id() []byte {
-	var (
-		firHash [32]byte
-		secHash [32]byte
-	)
-
-	firHash = sha256.Sum256(p.Serialize())
-	secHash = sha256.Sum256(firHash[:])
-
-	slices.Reverse(secHash[:])
-
-	return secHash[:]
-}
-
-func (p *Tx) Fee(txFetcher *TxFetcher) (uint64, error) {
-	var (
-		totalValueOfTxIns  uint64
-		valueOfTxIn        uint64
-		totalValueOfTxOuts uint64
-		err                error
-	)
-
-	for i := range p.txIns {
-		if valueOfTxIn, err = p.txIns[i].Value(txFetcher); err != nil {
-			return 0xffffffffffffffff, err
-		} else {
-			totalValueOfTxIns += valueOfTxIn
-		}
-	}
-
-	for i := range p.txOuts {
-		totalValueOfTxOuts += p.txOuts[i].Amount()
-	}
-
-	return totalValueOfTxIns - totalValueOfTxOuts, nil
-}
-
-// func (p *Tx) GetMessage(txFetcher *TxFetcher) ([]byte, error) {
-// 	tmp := p.Clone()
-
-// 	tt := []*Script
-// 	for i := range tmp.TxIns() {
-// 		if prevTx, err := txFetcher.FetchTx(hex.EncodeToString(tmp.txIns[i].prevTxId)); err != nil {
-// 			return nil, err
-// 		} else {
-// 			tmp.SetTxIns() prevTx.TxOuts()[tmp.TxIns()[i].PrevTxOutIdx()].ScriptPubKey()
-// 		}
-// 	}
-// }
-
-// func (p *Tx) GetMessage() []byte {
-
-// }
 
 func (p *Tx) Serialize() []byte {
-	var (
-		buf       bytes.Buffer
-		txInsLen  []byte
-		txOutsLen []byte
-	)
-
-	binary.Write(&buf, binary.LittleEndian, p.version)
-
-	txInsLen, _ = EncodeCVarint(uint64(len(p.txIns)))
-	buf.Write(txInsLen)
-	for i := range p.txIns {
-		buf.Write(p.txIns[i].Serialize())
+	b := binary.LittleEndian.AppendUint32(nil, p.version)
+	b = append(b, EncodeCVarint(uint64(len(p.txIns)))...)
+	for _, in := range p.txIns {
+		b = append(b, in.Serialize()...)
 	}
-
-	txOutsLen, _ = EncodeCVarint(uint64(len(p.txOuts)))
-	buf.Write(txOutsLen)
-	for i := range p.txOuts {
-		buf.Write(p.txOuts[i].Serialize())
+	b = append(b, EncodeCVarint(uint64(len(p.txOuts)))...)
+	for _, out := range p.txOuts {
+		b = append(b, out.Serialize()...)
 	}
-
-	binary.Write(&buf, binary.LittleEndian, p.locktime)
-
-	return buf.Bytes()
+	return binary.LittleEndian.AppendUint32(b, p.locktime)
 }
 
-func ParseTx(buf *bytes.Buffer) (*Tx, error) {
-	var (
-		bVersion  []byte
-		version   uint32
-		txInsLen  uint64
-		txIns     []*TxIn
-		txOutsLen uint64
-		txOuts    []*TxOut
-		bLocktime []byte
-		locktime  uint32
-		n         int
-		err       error
-	)
-
-	bVersion = make([]byte, 4)
-	if n, err = io.ReadFull(buf, bVersion); n < len(bVersion) || err != nil {
-		return nil, err
-	} else {
-		version = binary.LittleEndian.Uint32(bVersion)
+func ParseTx(r io.Reader) (*Tx, error) {
+	var b [4]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return nil, fmt.Errorf("tx version: %w", err)
 	}
+	tx := &Tx{version: binary.LittleEndian.Uint32(b[:])}
 
-	if txInsLen, err = DecodeCvarint(buf); err != nil {
+	nIn, err := DecodeCVarint(r)
+	if err != nil {
+		return nil, fmt.Errorf("tx input count: %w", noEOF(err))
+	}
+	if nIn == 0 {
+		return nil, ErrSegwitUnsupported
+	}
+	if tx.txIns, err = parseList(r, nIn, ParseTxIn, "txin"); err != nil {
 		return nil, err
 	}
 
-	txIns = make([]*TxIn, txInsLen)
-	for i := range txIns {
-		if txIns[i], err = ParseTxIn(buf); err != nil {
-			return nil, err
+	nOut, err := DecodeCVarint(r)
+	if err != nil {
+		return nil, fmt.Errorf("tx output count: %w", noEOF(err))
+	}
+	if tx.txOuts, err = parseList(r, nOut, ParseTxOut, "txout"); err != nil {
+		return nil, err
+	}
+
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return nil, fmt.Errorf("tx locktime: %w", noEOF(err))
+	}
+	tx.locktime = binary.LittleEndian.Uint32(b[:])
+
+	return tx, nil
+}
+
+func parseList[T any](r io.Reader, n uint64, parse func(io.Reader) (T, error), what string) ([]T, error) {
+	items := make([]T, 0, min(n, maxPrealloc))
+	for i := uint64(0); i < n; i++ {
+		item, err := parse(r)
+		if err != nil {
+			return nil, fmt.Errorf("%s %d: %w", what, i, noEOF(err))
 		}
+		items = append(items, item)
 	}
+	return items, nil
+}
 
-	if txOutsLen, err = DecodeCvarint(buf); err != nil {
-		return nil, err
+func cloneAll[T interface{ Clone() T }](src []T) []T {
+	dst := make([]T, len(src))
+	for i, v := range src {
+		dst[i] = v.Clone()
 	}
-
-	txOuts = make([]*TxOut, txOutsLen)
-	for i := range txOuts {
-		if txOuts[i], err = ParseTxOut(buf); err != nil {
-			return nil, err
-		}
-	}
-
-	bLocktime = make([]byte, 4)
-	if n, err = io.ReadFull(buf, bLocktime); n < len(bLocktime) || err != nil {
-		return nil, err
-	} else {
-		locktime = binary.LittleEndian.Uint32(bLocktime)
-	}
-
-	return &Tx{
-		version:  version,
-		txIns:    txIns,
-		txOuts:   txOuts,
-		locktime: locktime,
-	}, nil
+	return dst
 }

@@ -1,189 +1,154 @@
 package transaction
 
 import (
-	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 )
+
+const (
+	opPushBytes75 = 0x4b
+	opPushData1   = 0x4c
+	opPushData2   = 0x4d
+	opPushData4   = 0x4e
+)
+
+var ErrMalformedScript = errors.New("malformed script")
 
 type Script struct {
 	cmds []*ScriptElem
 }
 
 func NewScript(cmds []*ScriptElem) (*Script, error) {
-	var result Script
-
-	result.cmds = make([]*ScriptElem, len(cmds))
-	for i := range cmds {
-		result.cmds[i] = cmds[i].Clone()
+	if err := validateCmds(cmds); err != nil {
+		return nil, err
 	}
-
-	return &result, nil
+	return &Script{cmds: cloneScriptElems(cmds)}, nil
 }
 
 func (p *Script) Cmds() []*ScriptElem {
-	var result []*ScriptElem = make([]*ScriptElem, len(p.cmds))
-	for i := range p.cmds {
-		result[i] = p.cmds[i].Clone()
-	}
-
-	return result
+	return cloneScriptElems(p.cmds)
 }
-func (p *Script) SetCmds(cmds []*ScriptElem) error {
-	p.cmds = make([]*ScriptElem, len(cmds))
-	for i := range cmds {
-		p.cmds[i] = cmds[i].Clone()
-	}
 
+func (p *Script) SetCmds(cmds []*ScriptElem) error {
+	if err := validateCmds(cmds); err != nil {
+		return err
+	}
+	p.cmds = cloneScriptElems(cmds)
 	return nil
 }
 
 func (p *Script) Clone() *Script {
-	var result Script
-
-	result.cmds = make([]*ScriptElem, len(p.cmds))
-	for i := range p.cmds {
-		result.cmds[i] = p.cmds[i].Clone()
-	}
-
-	return &result
+	return &Script{cmds: cloneScriptElems(p.cmds)}
 }
 
 func (p *Script) String() string {
-	var scriptStr strings.Builder
-
-	for i := range p.cmds {
-		scriptStr.WriteString(fmt.Sprintf("%s, ", p.cmds[i].String()))
+	parts := make([]string, len(p.cmds))
+	for i, c := range p.cmds {
+		parts[i] = c.String()
 	}
-
-	return fmt.Sprintf("Script(%s)", scriptStr.String())
+	return "Script(" + strings.Join(parts, ", ") + ")"
 }
 
 func (p *Script) Serialize() []byte {
-	var (
-		buf        bytes.Buffer
-		bScriptLen []byte
-		bScript    []byte
-	)
-
-	for i := range p.cmds {
-		if p.cmds[i].IsOp() {
-			buf.Write(p.cmds[i].Serialize())
-
-			switch p.cmds[i].GetOpCode() {
-			case 0x4c:
-				buf.Write([]byte{uint8(p.cmds[i].GetElemLen())})
-			case 0x4d:
-				binary.Write(&buf, binary.LittleEndian, uint16(p.cmds[i].GetElemLen()))
-			case 0xff:
-				buf.Write([]byte{uint8(0xff)})
-			}
-		} else {
-			buf.Write(p.cmds[i].Serialize())
+	var raw []byte
+	for i, c := range p.cmds {
+		raw = append(raw, c.Serialize()...)
+		op, isOp := c.OpCode()
+		if lenSize, _ := pushInfo(op); isOp && lenSize > 0 {
+			var lb [4]byte
+			binary.LittleEndian.PutUint32(lb[:], uint32(p.cmds[i+1].Len()))
+			raw = append(raw, lb[:lenSize]...)
 		}
 	}
-
-	bScriptLen, _ = EncodeCVarint(uint64(buf.Len()))
-	bScript = append(bScriptLen, buf.Bytes()...)
-
-	return bScript
+	return append(EncodeCVarint(uint64(len(raw))), raw...)
 }
 
-func ParseScript(buf *bytes.Buffer) (*Script, error) {
-	var (
-		cmds       []*ScriptElem
-		bScriptLen uint64
-		bScript    []byte
-		scriptBuf  *bytes.Buffer
-		bOp        []byte
-		op         *ScriptElem
-		opCode     uint8
-		bData      []byte
-		data       *ScriptElem
-		bDataLen   []byte
-		dataLen    uint16
-		n          int
-		err        error
-	)
+func ParseScript(r io.Reader) (*Script, error) {
+	n, err := DecodeCVarint(r)
+	if err != nil {
+		return nil, fmt.Errorf("script length: %w", err)
+	}
 
-	if bScriptLen, err = DecodeCvarint(buf); err != nil {
+	if n > math.MaxInt64 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	b, err := io.ReadAll(io.LimitReader(r, int64(n)))
+	if err != nil {
 		return nil, err
 	}
-
-	bScript = make([]byte, bScriptLen)
-	if n, err = io.ReadFull(buf, bScript); n < len(bScript) || err != nil {
-		return nil, err
-	} else {
-		scriptBuf = bytes.NewBuffer(bScript)
+	if uint64(len(b)) != n {
+		return nil, io.ErrUnexpectedEOF
 	}
 
-	for scriptBuf.Len() > 0 {
-		bOp = make([]byte, 1)
-		if n, err = io.ReadFull(scriptBuf, bOp); n < len(bOp) || err != nil {
-			return nil, err
-		} else {
-			if op, err = NewScriptElem(bOp); err != nil {
-				return nil, err
-			} else {
-				cmds = append(cmds, op)
-			}
+	var cmds []*ScriptElem
+	for i := 0; i < len(b); {
+		op := b[i]
+		cmds = append(cmds, NewOpElem(op))
+		i++
+
+		lenSize, isPush := pushInfo(op)
+		if !isPush {
+			continue
 		}
 
-		opCode = op.GetOpCode()
-		switch {
-		case 1 <= opCode && opCode <= 75:
-			bData = make([]byte, opCode)
-			if n, err = io.ReadFull(scriptBuf, bData); n < len(bData) || err != nil {
-				return nil, err
-			} else {
-				if data, err = NewScriptElem(bData); err != nil {
-					return nil, err
-				} else {
-					cmds = append(cmds, data)
-				}
+		l := uint32(op)
+		if lenSize > 0 {
+			if len(b)-i < lenSize {
+				return nil, fmt.Errorf("%w: truncated length field of opcode %#x at offset %d", ErrMalformedScript, op, i-1)
 			}
-		case opCode == 0x4c:
-			bDataLen = make([]byte, 1)
-			if n, err = io.ReadFull(scriptBuf, bDataLen); n < len(bDataLen) || err != nil {
-				return nil, err
-			} else {
-				dataLen = uint16(bDataLen[0])
-			}
-
-			bData = make([]byte, dataLen)
-			if n, err = io.ReadFull(scriptBuf, bDataLen); n < len(bData) || err != nil {
-				return nil, err
-			} else {
-				if data, err = NewScriptElem(bData); err != nil {
-					return nil, err
-				} else {
-					cmds = append(cmds, data)
-				}
-			}
-		case opCode == 0x4d:
-			bDataLen = make([]byte, 2)
-			if n, err = io.ReadFull(scriptBuf, bDataLen); n < len(bDataLen) || err != nil {
-				return nil, err
-			} else {
-				dataLen = binary.LittleEndian.Uint16(bDataLen)
-			}
-
-			bData = make([]byte, dataLen)
-			if n, err = io.ReadFull(scriptBuf, bDataLen); n < len(bData) || err != nil {
-				return nil, err
-			} else {
-				if data, err = NewScriptElem(bData); err != nil {
-					return nil, err
-				} else {
-					cmds = append(cmds, data)
-				}
-			}
+			var lb [4]byte
+			copy(lb[:], b[i:i+lenSize])
+			l = binary.LittleEndian.Uint32(lb[:])
+			i += lenSize
 		}
+		if uint32(len(b)-i) < l {
+			return nil, fmt.Errorf("%w: push of %d bytes at offset %d runs past end of script", ErrMalformedScript, l, i)
+		}
+		cmds = append(cmds, NewDataElem(b[i:i+int(l)]))
+		i += int(l)
 	}
 
-	return &Script{
-		cmds: cmds,
-	}, nil
+	return &Script{cmds: cmds}, nil
+}
+
+func pushInfo(op byte) (lenSize int, isPush bool) {
+	switch {
+	case op >= 0x01 && op <= opPushBytes75:
+		return 0, true
+	case op == opPushData1:
+		return 1, true
+	case op == opPushData2:
+		return 2, true
+	case op == opPushData4:
+		return 4, true
+	default:
+		return 0, false
+	}
+}
+
+func validateCmds(cmds []*ScriptElem) error {
+	for i := 0; i < len(cmds); i++ {
+		op, isOp := cmds[i].OpCode()
+		if !isOp {
+			return fmt.Errorf("%w: data at cmd %d is not preceded by a push opcode", ErrMalformedScript, i)
+		}
+		lenSize, isPush := pushInfo(op)
+		if !isPush {
+			continue
+		}
+
+		i++
+		if i >= len(cmds) || cmds[i].IsOp() {
+			return fmt.Errorf("%w: push opcode %#x at cmd %d is not followed by data", ErrMalformedScript, op, i-1)
+		}
+		l := uint32(cmds[i].Len())
+		if (lenSize == 0 && l != uint32(op)) || (lenSize > 0 && l >= 1<<(8*lenSize)) {
+			return fmt.Errorf("%w: %d bytes of data do not match push opcode %#x", ErrMalformedScript, l, op)
+		}
+	}
+	return nil
 }

@@ -1,84 +1,60 @@
 package transaction
 
 import (
-	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 )
 
-func DecodeCvarint(buf *bytes.Buffer) (uint64, error) {
-	var (
-		bPrefix []byte
-		prefix  uint8
-		bNum    []byte
-		num     uint64
-		n       int
-		err     error
-	)
+const (
+	prefixUint16 = 0xfd
+	prefixUint32 = 0xfe
+	prefixUint64 = 0xff
+)
 
-	bPrefix = make([]byte, 1)
-	if n, err = io.ReadFull(buf, bPrefix); n < len(bPrefix) || err != nil {
-		return 0, nil
-	} else {
-		prefix = bPrefix[0]
+var ErrNonCanonicalCVarint = errors.New("non-canonical CompactSize varint")
+
+func DecodeCVarint(r io.Reader) (uint64, error) {
+	var b [8]byte
+	if _, err := io.ReadFull(r, b[:1]); err != nil {
+		return 0, fmt.Errorf("read CompactSize varint prefix: %w", err)
 	}
 
-	switch prefix {
-	case 0xfd:
-		bNum = make([]byte, 2)
-		if n, err = io.ReadFull(buf, bNum); n < len(bNum) || err != nil {
-			return 0, nil
-		} else {
-			num = binary.LittleEndian.Uint64(bNum)
-		}
-	case 0xfe:
-		bNum = make([]byte, 4)
-		if n, err = io.ReadFull(buf, bNum); n < len(bNum) || err != nil {
-			return 0, nil
-		} else {
-			num = binary.LittleEndian.Uint64(bNum)
-		}
-	case 0xff:
-		bNum = make([]byte, 8)
-		if n, err = io.ReadFull(buf, bNum); n < len(bNum) || err != nil {
-			return 0, nil
-		} else {
-			num = binary.LittleEndian.Uint64(bNum)
-		}
+	var size int
+	var minVal uint64
+
+	switch b[0] {
+	case prefixUint16:
+		size, minVal = 2, prefixUint16
+	case prefixUint32:
+		size, minVal = 4, 0x10000
+	case prefixUint64:
+		size, minVal = 8, 0x100000000
 	default:
-		num = uint64(prefix)
+		return uint64(b[0]), nil
 	}
 
-	return num, nil
+	if _, err := io.ReadFull(r, b[:size]); err != nil {
+		return 0, fmt.Errorf("read CompactSize varint body (%d bytes): %w", size, err)
+	}
+
+	v := binary.LittleEndian.Uint64(b[:])
+	if v < minVal {
+		return 0, ErrNonCanonicalCVarint
+	}
+	return v, nil
 }
 
-func EncodeCVarint(num uint64) ([]byte, error) {
-	var (
-		buf bytes.Buffer
-		err error
-	)
-
+func EncodeCVarint(v uint64) []byte {
 	switch {
-	case num <= 0xfd-1:
-		if err = binary.Write(&buf, binary.LittleEndian, uint8(num)); err != nil {
-			return nil, err
-		}
-	case num <= 0x10000-1:
-		buf.Write([]byte{uint8(0xfd)})
-		if err = binary.Write(&buf, binary.LittleEndian, uint16(num)); err != nil {
-			return nil, err
-		}
-	case num <= 0x100000000-1:
-		buf.Write([]byte{uint8(0xfe)})
-		if err = binary.Write(&buf, binary.LittleEndian, uint32(num)); err != nil {
-			return nil, err
-		}
-	case num <= 0x10000000000000000-1:
-		buf.Write([]byte{uint8(0xff)})
-		if err = binary.Write(&buf, binary.LittleEndian, uint64(num)); err != nil {
-			return nil, err
-		}
+	case v < prefixUint16:
+		return []byte{byte(v)}
+	case v <= 0xffff:
+		return binary.LittleEndian.AppendUint16([]byte{prefixUint16}, uint16(v))
+	case v <= 0xffffffff:
+		return binary.LittleEndian.AppendUint32([]byte{prefixUint32}, uint32(v))
+	default:
+		return binary.LittleEndian.AppendUint64([]byte{prefixUint64}, v)
 	}
-
-	return buf.Bytes(), nil
 }

@@ -3,114 +3,93 @@ package transaction
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
+)
+
+const DefaultBaseURL = "https://mempool.space/api"
+
+const maxTxHexSize = 8 << 20
+
+var (
+	ErrInvalidTxID  = errors.New("invalid txid")
+	ErrTxIDMismatch = errors.New("fetched tx does not match requested txid")
 )
 
 type TxFetcher struct {
-	cache map[string]*Tx
+	baseURL string
+	client  *http.Client
+	cache   map[[32]byte]*Tx
 }
 
-func NewTxFetcher(cache map[string]*Tx) (*TxFetcher, error) {
-	var txFetcher TxFetcher
+func NewTxFetcher(baseURL string, client *http.Client) *TxFetcher {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	return &TxFetcher{
+		baseURL: strings.TrimSuffix(baseURL, "/"),
+		client:  client,
+		cache:   make(map[[32]byte]*Tx),
+	}
+}
 
-	txFetcher.cache = make(map[string]*Tx, len(cache))
-	for k := range cache {
-		txFetcher.cache[k] = cache[k].Clone()
+func (p *TxFetcher) Add(tx *Tx) {
+	c := tx.Clone()
+	p.cache[c.ID()] = c
+}
+
+func (p *TxFetcher) FetchTx(txID [32]byte) (*Tx, error) {
+	if cached, ok := p.cache[txID]; ok {
+		return cached.Clone(), nil
 	}
 
-	return &txFetcher, nil
-}
-
-func (p *TxFetcher) Cache() map[string]*Tx {
-	var cache map[string]*Tx
-
-	cache = make(map[string]*Tx, len(cache))
-	for k := range p.cache {
-		cache[k] = p.cache[k].Clone()
+	tx, err := p.download(txID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch tx %x: %w", txID, err)
 	}
 
-	return cache
+	p.cache[txID] = tx
+	return tx.Clone(), nil
 }
-func (p *TxFetcher) SetCache(cache map[string]*Tx) error {
-	p.cache = make(map[string]*Tx, len(cache))
-	for k := range cache {
-		p.cache[k] = cache[k].Clone()
+
+func (p *TxFetcher) download(id [32]byte) (*Tx, error) {
+	resp, err := p.client.Get(fmt.Sprintf("%s/tx/%x/hex", p.baseURL, id))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status %s", resp.Status)
 	}
 
-	return nil
-}
-
-func (p *TxFetcher) Clone() *TxFetcher {
-	var txFetcher TxFetcher
-
-	txFetcher.cache = make(map[string]*Tx, len(p.cache))
-	for k := range p.cache {
-		txFetcher.cache[k] = p.cache[k].Clone()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTxHexSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if len(body) > maxTxHexSize {
+		return nil, fmt.Errorf("response larger than %d bytes", maxTxHexSize)
 	}
 
-	return &txFetcher
-}
-
-func (p *TxFetcher) String() string {
-	var txFetcherStr strings.Builder
-
-	for k, v := range p.cache {
-		txFetcherStr.WriteString(k)
-		txFetcherStr.WriteString("\n")
-		txFetcherStr.WriteString(fmt.Sprintf("%v", v))
-		txFetcherStr.WriteString("\n")
+	raw, err := hex.DecodeString(strings.TrimSpace(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("decode response hex: %w", err)
 	}
 
-	return fmt.Sprintf("TxFetcher(\n%s)", txFetcherStr.String())
-}
-
-func GetUrl() string {
-	return "https://mempool.space/api"
-}
-
-func (p *TxFetcher) FetchTx(txId string) (*Tx, error) {
-	var (
-		val   *Tx
-		ok    bool
-		url   string
-		resp  *http.Response
-		body  []byte
-		text  string
-		bText []byte
-		tx    *Tx
-		err   error
-	)
-
-	val, ok = p.cache[txId]
-	if ok {
-		return val.Clone(), nil
-	} else {
-		url = fmt.Sprintf("%s/tx/%s/hex", GetUrl(), txId)
-
-		if resp, err = http.Get(url); err != nil {
-			return nil, err
-		}
-
-		defer resp.Body.Close()
-
-		if body, err = io.ReadAll(resp.Body); err != nil {
-			return nil, err
-		}
-
-		text = strings.TrimSpace(string(body))
-
-		if bText, err = hex.DecodeString(text); err != nil {
-			return nil, err
-		}
-
-		if tx, err = ParseTx(bytes.NewBuffer(bText)); err != nil {
-			return nil, err
-		} else {
-			p.cache[txId] = tx
-			return p.cache[txId].Clone(), nil
-		}
+	r := bytes.NewReader(raw)
+	tx, err := ParseTx(r)
+	if err != nil {
+		return nil, err
 	}
+	if r.Len() != 0 {
+		return nil, fmt.Errorf("%d unexpected bytes after transaction", r.Len())
+	}
+	if got := tx.ID(); got != id {
+		return nil, fmt.Errorf("%w: got %x", ErrTxIDMismatch, got)
+	}
+	return tx, nil
 }

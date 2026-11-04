@@ -1,66 +1,59 @@
 package transaction
 
 import (
+	"bytes"
 	"encoding/hex"
 )
 
 type ScriptElem struct {
-	elem []byte
+	data []byte
+	op   byte
+	isOp bool
 }
 
-func NewScriptElem(elem []byte) (*ScriptElem, error) {
-	var result ScriptElem
-
-	result.elem = make([]byte, len(elem))
-	copy(result.elem, elem)
-
-	return &result, nil
+func NewDataElem(data []byte) *ScriptElem {
+	return &ScriptElem{data: bytes.Clone(data)}
 }
 
-func (p *ScriptElem) Elem() []byte {
-	var result []byte
-
-	result = make([]byte, len(p.elem))
-	copy(result, p.elem)
-
-	return result
+func (p *ScriptElem) Data() []byte {
+	return bytes.Clone(p.data)
 }
-func (p *ScriptElem) SetElem(elem []byte) error {
-	p.elem = make([]byte, len(elem))
-	copy(p.elem, elem)
 
-	return nil
+func NewOpElem(op byte) *ScriptElem {
+	return &ScriptElem{op: op, isOp: true}
 }
 
 func (p *ScriptElem) Clone() *ScriptElem {
-	var result ScriptElem
-
-	result.elem = make([]byte, len(p.elem))
-	copy(result.elem, p.elem)
-
-	return &result
-}
-
-func (p *ScriptElem) String() string {
-	return hex.EncodeToString(p.elem)
-}
-
-func (p *ScriptElem) Serialize() []byte {
-	return p.elem
-}
-
-func (p *ScriptElem) GetElemLen() uint16 {
-	return uint16(len(p.elem))
+	return &ScriptElem{data: bytes.Clone(p.data), op: p.op, isOp: p.isOp}
 }
 
 func (p *ScriptElem) IsOp() bool {
-	return len(p.elem) == 1
+	return p.isOp
 }
 
-func (p *ScriptElem) GetOpCode() uint8 {
-	if len(p.elem) == 1 {
-		return p.elem[0]
-	} else {
-		return 0xff
+func (p *ScriptElem) OpCode() (op byte, ok bool) {
+	return p.op, p.isOp
+}
+
+func (p *ScriptElem) Len() int {
+	return len(p.data)
+}
+
+func (p *ScriptElem) String() string {
+	return hex.EncodeToString(p.Serialize())
+}
+
+func (p *ScriptElem) Serialize() []byte {
+	if p.isOp {
+		return []byte{p.op}
 	}
+	return bytes.Clone(p.data)
+}
+
+func cloneScriptElems(src []*ScriptElem) []*ScriptElem {
+	dst := make([]*ScriptElem, len(src))
+	for i, e := range src {
+		dst[i] = e.Clone()
+	}
+	return dst
 }
